@@ -1,0 +1,183 @@
+name: Deploy Lambda
+
+on:
+  push:
+    branches:
+      - main
+      - test
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout repository
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 3. Install dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          sudo apt-get update
+          sudo apt-get install -y zip jq
+
+      # 4. Set environment-specific configuration
+      - name: Set environment variables
+        env:
+          PROD_API_KEY: ${{ secrets.PROD_API_KEY }}
+          TEST_API_KEY: ${{ secrets.TEST_API_KEY }}
+          TEST_ROLE: ${{ vars.LAMBDA_ROLE_ARN_TEST }}
+          PROD_ROLE: ${{ vars.LAMBDA_ROLE_ARN_PROD }}
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            echo "ENV=prod" >> "$GITHUB_ENV"
+            echo "LOG_LEVEL=INFO" >> "$GITHUB_ENV"
+            echo "FUNCTION_NAME=cicd_lambda_prod" >> "$GITHUB_ENV"
+            echo "LAMBDA_ROLE_ARN=$PROD_ROLE" >> "$GITHUB_ENV"
+            echo "API_KEY=$PROD_API_KEY" >> "$GITHUB_ENV"
+          else
+            echo "ENV=test" >> "$GITHUB_ENV"
+            echo "LOG_LEVEL=DEBUG" >> "$GITHUB_ENV"
+            echo "FUNCTION_NAME=cicd_lambda_test" >> "$GITHUB_ENV"
+            echo "LAMBDA_ROLE_ARN=$TEST_ROLE" >> "$GITHUB_ENV"
+            echo "API_KEY=$TEST_API_KEY" >> "$GITHUB_ENV"
+          fi
+
+      # 5. Package Lambda function
+      - name: Package Lambda Function
+        run: |
+          rm -rf lambda_function/package lambda.zip
+          mkdir -p lambda_function/package
+
+          python -m pip install \
+            --no-cache-dir \
+            -r lambda_function/requirements.txt \
+            -t lambda_function/package
+
+          cp lambda_function/app.py lambda_function/package/
+
+          cd lambda_function/package
+          zip -qr ../../lambda.zip .
+          cd ../..
+
+          echo "Lambda package created successfully."
+
+      # 6. Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      # 7. Deploy Lambda
+      - name: Deploy to AWS Lambda
+        run: |
+          set -e
+
+          REGION="us-east-1"
+
+          echo "=================================="
+          echo "Deploying Lambda: $FUNCTION_NAME"
+          echo "Environment: $ENV"
+          echo "Region: $REGION"
+          echo "=================================="
+
+          # Validate configuration
+          if [[ -z "$LAMBDA_ROLE_ARN" ]]; then
+            echo "ERROR: Lambda execution role ARN is missing."
+            exit 1
+          fi
+
+          if [[ -z "$API_KEY" ]]; then
+            echo "ERROR: API key is missing."
+            exit 1
+          fi
+
+          # Build environment configuration safely
+          ENV_CONFIG=$(jq -n \
+            --arg env "$ENV" \
+            --arg api_key "$API_KEY" \
+            --arg log_level "$LOG_LEVEL" \
+            '{Variables: {ENV: $env, API_KEY: $api_key, LOG_LEVEL: $log_level}}')
+
+          # Check if Lambda exists
+          if aws lambda get-function \
+            --function-name "$FUNCTION_NAME" \
+            --region "$REGION" >/dev/null 2>lambda_error.log; then
+
+            echo "Lambda exists. Updating function..."
+
+            # Update Lambda code
+            aws lambda update-function-code \
+              --function-name "$FUNCTION_NAME" \
+              --region "$REGION" \
+              --zip-file fileb://lambda.zip
+
+            # Wait for code update
+            aws lambda wait function-updated-v2 \
+              --function-name "$FUNCTION_NAME" \
+              --region "$REGION"
+
+            echo "Lambda code updated successfully."
+
+            # Update Lambda configuration
+            aws lambda update-function-configuration \
+              --function-name "$FUNCTION_NAME" \
+              --region "$REGION" \
+              --environment "$ENV_CONFIG"
+
+            # Wait for configuration update
+            aws lambda wait function-updated-v2 \
+              --function-name "$FUNCTION_NAME" \
+              --region "$REGION"
+
+            echo "Lambda configuration updated successfully."
+
+          else
+
+            if grep -q "ResourceNotFoundException" lambda_error.log; then
+
+              echo "Lambda does not exist. Creating function..."
+
+              aws lambda create-function \
+                --function-name "$FUNCTION_NAME" \
+                --runtime python3.11 \
+                --role "$LAMBDA_ROLE_ARN" \
+                --handler app.lambda_handler \
+                --timeout 300 \
+                --zip-file fileb://lambda.zip \
+                --region "$REGION" \
+                --environment "$ENV_CONFIG"
+
+              # Wait until Lambda becomes active
+              aws lambda wait function-active-v2 \
+                --function-name "$FUNCTION_NAME" \
+                --region "$REGION"
+
+              echo "Lambda function created successfully."
+
+            else
+
+              echo "ERROR: Unable to check Lambda function."
+              cat lambda_error.log
+              exit 1
+
+            fi
+          fi
+
+          echo "=================================="
+          echo "Lambda deployment completed."
+          echo "Function: $FUNCTION_NAME"
+          echo "Environment: $ENV"
+          echo "==================================""
