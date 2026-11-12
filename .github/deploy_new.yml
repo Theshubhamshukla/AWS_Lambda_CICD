@@ -180,4 +180,4 @@ jobs:
           echo "Lambda deployment completed."
           echo "Function: $FUNCTION_NAME"
           echo "Environment: $ENV"
-          echo "==================================""
+          echo "=================================="
